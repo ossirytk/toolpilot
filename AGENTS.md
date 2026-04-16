@@ -1,7 +1,7 @@
 # AGENTS.md — Project Rules for AI Assistants (Rust + Python)
 
 This repository is currently developed primarily from a **Windows dev drive** using **PowerShell** and **VS Code**.  
-**WSL:Ubuntu**, **fish**, and **NvChad Neovim** remain supported alternative workflows.  
+**WSL:Arc Linux**, **fish**, and **NvChad Neovim** remain supported alternative workflows.  
 All tooling runs via terminal commands. The core server is written in **Rust** (managed with `cargo`).  
 Contributors maintain CLI-first workflows with minimal, deterministic diffs that comply with repository standards.
 

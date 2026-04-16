@@ -511,12 +511,23 @@ fn build_tree_entry(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
-    let metadata = std::fs::metadata(path).map_err(|_| ToolError {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ToolError {
         code: "PathNotFound".to_string(),
         message: format!("Cannot read metadata: {}", path.display()),
     })?;
+    let file_type = metadata.file_type();
 
-    if metadata.is_file() {
+    if file_type.is_symlink() {
+        *total += 1;
+        return Ok(FsTreeEntry {
+            name,
+            kind: "symlink".to_string(),
+            size_bytes: None,
+            children: None,
+        });
+    }
+
+    if file_type.is_file() {
         *total += 1;
         return Ok(FsTreeEntry {
             name,
@@ -577,8 +588,11 @@ fn build_tree_entry(
 }
 
 pub fn execute_fs_tree(input: FsTreeInput) -> ToolResult<FsTreeOutput> {
-    let max_depth = input.max_depth.unwrap_or(4).min(MAX_TREE_DEPTH_HARD_CAP);
-    let max_entries = input.max_entries.unwrap_or(MAX_TREE_ENTRIES_DEFAULT);
+    let max_depth = input
+        .max_depth
+        .unwrap_or(4)
+        .clamp(1, MAX_TREE_DEPTH_HARD_CAP);
+    let max_entries = input.max_entries.unwrap_or(MAX_TREE_ENTRIES_DEFAULT).max(1);
     if max_entries > MAX_TREE_ENTRIES_HARD_CAP {
         return Err(ToolError {
             code: "InvalidInput".to_string(),
@@ -1182,6 +1196,55 @@ mod tests {
     }
 
     #[test]
+    fn fs_tree_normalizes_zero_limits_to_schema_minimum() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "x").unwrap();
+        fs::write(dir.path().join("b.txt"), "x").unwrap();
+        let out = execute_fs_tree(FsTreeInput {
+            path: dir.path().to_string_lossy().to_string(),
+            max_depth: Some(0),
+            include_hidden: None,
+            max_entries: Some(0),
+        })
+        .unwrap();
+
+        assert_eq!(out.total_entries, 1);
+        assert!(out.truncated);
+        assert!(
+            out.tree
+                .children
+                .as_ref()
+                .is_some_and(|children| children.is_empty())
+        );
+    }
+
+    #[test]
+    fn fs_tree_represents_symlink_without_recursing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inside.txt"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&target, root.join("link")).unwrap();
+
+        let out = execute_fs_tree(FsTreeInput {
+            path: root.to_string_lossy().to_string(),
+            max_depth: Some(4),
+            include_hidden: Some(true),
+            max_entries: Some(10),
+        })
+        .unwrap();
+
+        let children = out.tree.children.unwrap();
+        let link = children.iter().find(|entry| entry.name == "link").unwrap();
+        assert_eq!(link.kind, "symlink");
+        assert!(link.children.is_none());
+    }
+
+    #[test]
     fn yaml_select_extracts_nested_fields_from_toml() {
         let dir = tempdir().unwrap();
         let toml_path = dir.path().join("Cargo.toml");
@@ -1281,10 +1344,27 @@ mod tests {
     }
 
     #[test]
-    fn git_log_returns_commits_for_current_repo() {
-        // Use the toolpilot repo itself (must have at least one commit)
+    fn git_log_returns_commits_for_temp_repo() {
+        let dir = tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("README.md")).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Toolpilot Test", "toolpilot@example.com").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "initial commit",
+            &tree,
+            &[],
+        )
+        .unwrap();
+
         let out = execute_git_log(GitLogInput {
-            repo_path: ".".to_string(),
+            repo_path: dir.path().to_string_lossy().to_string(),
             path_filter: None,
             max_results: Some(5),
             include_diff_stat: Some(false),
