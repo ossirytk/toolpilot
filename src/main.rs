@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin, stdout};
 use toolpilot::{
-    FsGlobInput, JsonSelectInput, ServerState, TextSearchInput, execute_fs_glob,
-    execute_json_select, execute_text_search, tool_definitions,
+    FsGlobInput, FsTreeInput, GitLogInput, JsonSelectInput, ServerState, TextSearchInput,
+    YamlSelectInput, execute_fs_glob, execute_fs_tree, execute_git_log, execute_json_select,
+    execute_text_search, execute_yaml_select, tool_definitions,
 };
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +72,26 @@ fn execute_tool(state: &mut ServerState, name: &str, args: Value) -> Value {
                     execute_json_select(state, input).map_err(|e| json!({ "error": e }))?,
                 )
                 .map_err(|_| invalid_params("Serialization failed"))
+            }),
+        "fs_tree" => serde_json::from_value::<FsTreeInput>(args)
+            .map_err(|_| invalid_params("Invalid fs_tree arguments"))
+            .and_then(|input| {
+                serde_json::to_value(execute_fs_tree(input).map_err(|e| json!({ "error": e }))?)
+                    .map_err(|_| invalid_params("Serialization failed"))
+            }),
+        "yaml_select" => serde_json::from_value::<YamlSelectInput>(args)
+            .map_err(|_| invalid_params("Invalid yaml_select arguments"))
+            .and_then(|input| {
+                serde_json::to_value(
+                    execute_yaml_select(state, input).map_err(|e| json!({ "error": e }))?,
+                )
+                .map_err(|_| invalid_params("Serialization failed"))
+            }),
+        "git_log" => serde_json::from_value::<GitLogInput>(args)
+            .map_err(|_| invalid_params("Invalid git_log arguments"))
+            .and_then(|input| {
+                serde_json::to_value(execute_git_log(input).map_err(|e| json!({ "error": e }))?)
+                    .map_err(|_| invalid_params("Serialization failed"))
             }),
         "server_stats" => Ok(state.metrics_json()),
         _ => Err(json!({
