@@ -1210,12 +1210,12 @@ mod tests {
 
         assert_eq!(out.total_entries, 1);
         assert!(out.truncated);
-        assert!(
-            out.tree
-                .children
-                .as_ref()
-                .is_some_and(|children| children.is_empty())
-        );
+        let root_has_no_children = out
+            .tree
+            .children
+            .as_ref()
+            .is_some_and(|children| children.is_empty());
+        assert!(root_has_no_children);
     }
 
     #[test]
