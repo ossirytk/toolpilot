@@ -14,6 +14,7 @@ pub const MAX_PATHS: usize = 128;
 pub const MAX_PATTERN_LENGTH: usize = 512;
 pub const MAX_FIELDS: usize = 64;
 pub const MAX_RESULTS_DEFAULT: usize = 200;
+pub const MAX_RESULTS_HARD_CAP: usize = 5000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolError {
@@ -22,6 +23,17 @@ pub struct ToolError {
 }
 
 type ToolResult<T> = Result<T, ToolError>;
+
+fn resolve_max_results(max_results: Option<usize>) -> ToolResult<usize> {
+    let value = max_results.unwrap_or(MAX_RESULTS_DEFAULT).max(1);
+    if value > MAX_RESULTS_HARD_CAP {
+        return Err(ToolError {
+            code: "InvalidInput".to_string(),
+            message: format!("max_results cannot exceed {}", MAX_RESULTS_HARD_CAP),
+        });
+    }
+    Ok(value)
+}
 
 #[derive(Clone)]
 struct CachedJson {
@@ -178,7 +190,7 @@ pub fn execute_fs_glob(input: FsGlobInput) -> ToolResult<FsGlobOutput> {
             message: "patterns must contain between 1 and 128 items".to_string(),
         });
     }
-    let max_results = input.max_results.unwrap_or(MAX_RESULTS_DEFAULT).max(1);
+    let max_results = resolve_max_results(input.max_results)?;
     let base_path = PathBuf::from(input.base_path);
     let mut all = Vec::new();
     for pattern in &input.patterns {
@@ -260,7 +272,7 @@ pub fn execute_text_search(
     }
 
     let case_sensitive = input.case_sensitive.unwrap_or(true);
-    let max_results = input.max_results.unwrap_or(MAX_RESULTS_DEFAULT).max(1);
+    let max_results = resolve_max_results(input.max_results)?;
     let compiled_pattern = match input.mode {
         SearchMode::Literal => regex::escape(&input.query),
         SearchMode::Regex => input.query,
@@ -272,6 +284,7 @@ pub fn execute_text_search(
     paths.dedup();
 
     let mut matches = Vec::new();
+    let mut truncated = false;
     'paths: for path in paths {
         let mmap = state.load_text(Path::new(&path))?;
         let content = std::str::from_utf8(&mmap).map_err(|_| ToolError {
@@ -282,6 +295,10 @@ pub fn execute_text_search(
         let mut line_start = 0usize;
         for line in content.split_inclusive('\n') {
             for capture in regex.find_iter(line) {
+                if matches.len() == max_results {
+                    truncated = true;
+                    break 'paths;
+                }
                 matches.push(TextMatch {
                     file: path.clone(),
                     line: line_no,
@@ -289,9 +306,6 @@ pub fn execute_text_search(
                     byte_end: line_start + capture.end(),
                     text: line.trim_end_matches('\n').to_string(),
                 });
-                if matches.len() >= max_results {
-                    break 'paths;
-                }
             }
             line_start += line.len();
             line_no += 1;
@@ -302,7 +316,7 @@ pub fn execute_text_search(
     Ok(TextSearchOutput {
         matches,
         count,
-        truncated: count >= max_results,
+        truncated,
     })
 }
 
@@ -347,7 +361,7 @@ pub fn execute_json_select(
             message: "fields must contain between 1 and 64 items".to_string(),
         });
     }
-    let max_results = input.max_results.unwrap_or(MAX_RESULTS_DEFAULT).max(1);
+    let max_results = resolve_max_results(input.max_results)?;
     let value = state.load_json(Path::new(&input.path))?;
     let rows: Vec<&Value> = match value.as_array() {
         Some(arr) => arr.iter().collect(),
@@ -355,6 +369,7 @@ pub fn execute_json_select(
     };
     let filters = input.filters.unwrap_or_default();
     let mut selected_rows = Vec::new();
+    let mut truncated = false;
     for row in rows {
         let obj = row.as_object().ok_or_else(|| ToolError {
             code: "InvalidJsonShape".to_string(),
@@ -380,6 +395,10 @@ pub fn execute_json_select(
             }
         }
         if include {
+            if selected_rows.len() == max_results {
+                truncated = true;
+                break;
+            }
             let mut out = serde_json::Map::new();
             for field in &input.fields {
                 out.insert(
@@ -388,16 +407,13 @@ pub fn execute_json_select(
                 );
             }
             selected_rows.push(Value::Object(out));
-            if selected_rows.len() >= max_results {
-                break;
-            }
         }
     }
     let count = selected_rows.len();
     Ok(JsonSelectOutput {
         rows: selected_rows,
         count,
-        truncated: count >= max_results,
+        truncated,
     })
 }
 
@@ -576,5 +592,83 @@ mod tests {
         };
         let _ = execute_json_select(&mut state, input2).unwrap();
         assert!(state.cache_hits >= 1);
+    }
+
+    #[test]
+    fn rejects_max_results_over_hard_cap() {
+        let dir = tempdir().unwrap();
+        let txt_path = dir.path().join("a.txt");
+        fs::write(&txt_path, "x").unwrap();
+        let glob_err = execute_fs_glob(FsGlobInput {
+            base_path: dir.path().to_string_lossy().to_string(),
+            patterns: vec!["*.txt".to_string()],
+            max_results: Some(MAX_RESULTS_HARD_CAP + 1),
+        })
+        .unwrap_err();
+        assert_eq!(glob_err.code, "InvalidInput");
+
+        let mut state = ServerState::new();
+        let search_err = execute_text_search(
+            &mut state,
+            TextSearchInput {
+                paths: vec![txt_path.to_string_lossy().to_string()],
+                query: "x".to_string(),
+                mode: SearchMode::Literal,
+                case_sensitive: Some(true),
+                max_results: Some(MAX_RESULTS_HARD_CAP + 1),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(search_err.code, "InvalidInput");
+
+        let json_path = dir.path().join("data.json");
+        fs::write(&json_path, r#"[{"name":"x"}]"#).unwrap();
+        let json_err = execute_json_select(
+            &mut state,
+            JsonSelectInput {
+                path: json_path.to_string_lossy().to_string(),
+                fields: vec!["name".to_string()],
+                filters: None,
+                max_results: Some(MAX_RESULTS_HARD_CAP + 1),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(json_err.code, "InvalidInput");
+    }
+
+    #[test]
+    fn truncated_is_false_when_exactly_at_limit_without_extra_matches() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("x.log");
+        fs::write(&file_path, "needle\n").unwrap();
+        let mut state = ServerState::new();
+        let text = execute_text_search(
+            &mut state,
+            TextSearchInput {
+                paths: vec![file_path.to_string_lossy().to_string()],
+                query: "needle".to_string(),
+                mode: SearchMode::Literal,
+                case_sensitive: Some(true),
+                max_results: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(text.count, 1);
+        assert!(!text.truncated);
+
+        let json_path = dir.path().join("single.json");
+        fs::write(&json_path, r#"[{"name":"one"}]"#).unwrap();
+        let json = execute_json_select(
+            &mut state,
+            JsonSelectInput {
+                path: json_path.to_string_lossy().to_string(),
+                fields: vec!["name".to_string()],
+                filters: None,
+                max_results: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(json.count, 1);
+        assert!(!json.truncated);
     }
 }

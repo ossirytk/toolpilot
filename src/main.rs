@@ -26,11 +26,6 @@ struct RpcResponse {
     error: Option<Value>,
 }
 
-fn log_debug(_message: &str) {
-    #[cfg(feature = "verbose-logging")]
-    eprintln!("{message}");
-}
-
 fn invalid_params(message: &str) -> Value {
     json!({
         "error": {
@@ -173,9 +168,22 @@ async fn main() -> io::Result<()> {
     while let Some(payload) = read_message(&mut reader).await? {
         let request: RpcRequest = match serde_json::from_slice(&payload) {
             Ok(request) => request,
-            Err(_) => continue,
+            Err(_) => {
+                let response = RpcResponse {
+                    jsonrpc: "2.0",
+                    id: Value::Null,
+                    result: None,
+                    error: Some(json!({
+                        "code": -32700,
+                        "message": "Parse error"
+                    })),
+                };
+                write_message(&mut writer, &response).await?;
+                continue;
+            }
         };
-        log_debug(&format!("received method={}", request.method));
+        #[cfg(feature = "verbose-logging")]
+        eprintln!("received method={}", request.method);
         let response = handle_request(&mut state, request);
         write_message(&mut writer, &response).await?;
     }
