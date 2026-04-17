@@ -160,7 +160,8 @@ async fn read_message(reader: &mut BufReader<tokio::io::Stdin>) -> io::Result<Op
             return Ok(None);
         }
         // Newline-delimited JSON: the line IS the message body
-        if line.starts_with('{') {
+        let ndjson_candidate = line.trim_start();
+        if ndjson_candidate.starts_with('{') || ndjson_candidate.starts_with('[') {
             let trimmed = line.trim_end_matches(['\r', '\n']).as_bytes().to_vec();
             return Ok(Some(trimmed));
         }
@@ -184,9 +185,10 @@ async fn read_message(reader: &mut BufReader<tokio::io::Stdin>) -> io::Result<Op
 }
 
 async fn write_message(writer: &mut tokio::io::Stdout, response: &RpcResponse) -> io::Result<()> {
-    let mut payload = serde_json::to_vec(response)
+    let payload = serde_json::to_vec(response)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "serialization failed"))?;
-    payload.push(b'\n');
+    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
+    writer.write_all(header.as_bytes()).await?;
     writer.write_all(&payload).await?;
     writer.flush().await
 }
@@ -198,25 +200,36 @@ async fn main() -> io::Result<()> {
     let mut writer = stdout();
 
     while let Some(payload) = read_message(&mut reader).await? {
-        let request: RpcRequest = match serde_json::from_slice(&payload) {
+        let value: Value = match serde_json::from_slice(&payload) {
+            Ok(value) => value,
+            Err(_) => {
+                // Parse error: malformed JSON payload.
+                let response = RpcResponse {
+                    jsonrpc: "2.0",
+                    id: Value::Null,
+                    result: None,
+                    error: Some(json!({
+                        "code": -32700,
+                        "message": "Parse error"
+                    })),
+                };
+                write_message(&mut writer, &response).await?;
+                continue;
+            }
+        };
+        let request: RpcRequest = match serde_json::from_value(value.clone()) {
             Ok(request) => request,
             Err(_) => {
-                // Only send a parse-error response if we can extract an id; notifications
-                // (no id) must never receive a response per JSON-RPC 2.0.
-                if let Ok(probe) = serde_json::from_slice::<Value>(&payload)
-                    && probe.get("id").is_some()
-                {
-                    let response = RpcResponse {
-                        jsonrpc: "2.0",
-                        id: probe["id"].clone(),
-                        result: None,
-                        error: Some(json!({
-                            "code": -32700,
-                            "message": "Parse error"
-                        })),
-                    };
-                    write_message(&mut writer, &response).await?;
-                }
+                let response = RpcResponse {
+                    jsonrpc: "2.0",
+                    id: value.get("id").cloned().unwrap_or(Value::Null),
+                    result: None,
+                    error: Some(json!({
+                        "code": -32600,
+                        "message": "Invalid Request"
+                    })),
+                };
+                write_message(&mut writer, &response).await?;
                 continue;
             }
         };

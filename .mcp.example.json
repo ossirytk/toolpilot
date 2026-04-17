@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "toolpilot": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--release", "--"]
+    }
+  }
+}

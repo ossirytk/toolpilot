@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "toolpilot": {
-      "type": "stdio",
-      "command": "/home/mr_admin/repos/toolpilot/target/release/toolpilot",
-      "args": []
-    }
-  }
-}
