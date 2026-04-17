@@ -162,7 +162,10 @@ async fn read_message(reader: &mut BufReader<tokio::io::Stdin>) -> io::Result<Op
         // Newline-delimited JSON: the line IS the message body
         let ndjson_candidate = line.trim_start();
         if ndjson_candidate.starts_with('{') || ndjson_candidate.starts_with('[') {
-            let trimmed = line.trim_end_matches(['\r', '\n']).as_bytes().to_vec();
+            let trimmed = ndjson_candidate
+                .trim_end_matches(['\r', '\n'])
+                .as_bytes()
+                .to_vec();
             return Ok(Some(trimmed));
         }
         // Content-Length framing
@@ -217,12 +220,13 @@ async fn main() -> io::Result<()> {
                 continue;
             }
         };
-        let request: RpcRequest = match serde_json::from_value(value.clone()) {
+        let request_id = value.get("id").cloned().unwrap_or(Value::Null);
+        let request: RpcRequest = match serde_json::from_value(value) {
             Ok(request) => request,
             Err(_) => {
                 let response = RpcResponse {
                     jsonrpc: "2.0",
-                    id: value.get("id").cloned().unwrap_or(Value::Null),
+                    id: request_id,
                     result: None,
                     error: Some(json!({
                         "code": -32600,
