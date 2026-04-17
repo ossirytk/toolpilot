@@ -11,7 +11,9 @@ use toolpilot::{
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
-    id: Value,
+    // Notifications omit `id`; treat those as fire-and-forget (no response sent).
+    #[serde(default)]
+    id: Option<Value>,
     method: String,
     #[serde(default)]
     params: Value,
@@ -108,10 +110,13 @@ fn execute_tool(state: &mut ServerState, name: &str, args: Value) -> Value {
     }
 }
 
-fn handle_request(state: &mut ServerState, request: RpcRequest) -> RpcResponse {
+fn handle_request(state: &mut ServerState, request: RpcRequest) -> Option<RpcResponse> {
+    // Notifications have no `id` — must not send a response.
+    let id = request.id?;
+
     let result = match request.method.as_str() {
         "initialize" => Some(json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": request.params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2024-11-05"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "toolpilot", "version": "0.1.0"}
         })),
@@ -123,36 +128,47 @@ fn handle_request(state: &mut ServerState, request: RpcRequest) -> RpcResponse {
             };
             Some(json!({"structuredContent": payload}))
         }
+        "ping" => Some(json!({})),
         _ => None,
     };
     if let Some(result) = result {
-        RpcResponse {
+        Some(RpcResponse {
             jsonrpc: "2.0",
-            id: request.id,
+            id,
             result: Some(result),
             error: None,
-        }
+        })
     } else {
-        RpcResponse {
+        Some(RpcResponse {
             jsonrpc: "2.0",
-            id: request.id,
+            id,
             result: None,
             error: Some(json!({
                 "code": -32601,
                 "message": "Method not found"
             })),
-        }
+        })
     }
 }
 
 async fn read_message(reader: &mut BufReader<tokio::io::Stdin>) -> io::Result<Option<Vec<u8>>> {
-    let mut content_length = None;
+    let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
         let read = reader.read_line(&mut line).await?;
         if read == 0 {
             return Ok(None);
         }
+        // Newline-delimited JSON: the line IS the message body
+        let ndjson_candidate = line.trim_start();
+        if ndjson_candidate.starts_with('{') || ndjson_candidate.starts_with('[') {
+            let trimmed = ndjson_candidate
+                .trim_end_matches(['\r', '\n'])
+                .as_bytes()
+                .to_vec();
+            return Ok(Some(trimmed));
+        }
+        // Content-Length framing
         if line == "\r\n" || line == "\n" {
             break;
         }
@@ -187,9 +203,10 @@ async fn main() -> io::Result<()> {
     let mut writer = stdout();
 
     while let Some(payload) = read_message(&mut reader).await? {
-        let request: RpcRequest = match serde_json::from_slice(&payload) {
-            Ok(request) => request,
+        let value: Value = match serde_json::from_slice(&payload) {
+            Ok(value) => value,
             Err(_) => {
+                // Parse error: malformed JSON payload.
                 let response = RpcResponse {
                     jsonrpc: "2.0",
                     id: Value::Null,
@@ -203,10 +220,28 @@ async fn main() -> io::Result<()> {
                 continue;
             }
         };
+        let request_id = value.get("id").cloned().unwrap_or(Value::Null);
+        let request: RpcRequest = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(_) => {
+                let response = RpcResponse {
+                    jsonrpc: "2.0",
+                    id: request_id,
+                    result: None,
+                    error: Some(json!({
+                        "code": -32600,
+                        "message": "Invalid Request"
+                    })),
+                };
+                write_message(&mut writer, &response).await?;
+                continue;
+            }
+        };
         #[cfg(feature = "verbose-logging")]
         eprintln!("received method={}", request.method);
-        let response = handle_request(&mut state, request);
-        write_message(&mut writer, &response).await?;
+        if let Some(response) = handle_request(&mut state, request) {
+            write_message(&mut writer, &response).await?;
+        }
     }
     Ok(())
 }
