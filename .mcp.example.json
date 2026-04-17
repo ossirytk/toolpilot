@@ -2,8 +2,7 @@
   "mcpServers": {
     "toolpilot": {
       "type": "stdio",
-      "command": "cargo",
-      "args": ["run", "--release", "--"]
+      "command": "/absolute/path/to/toolpilot/target/release/toolpilot"
     }
   }
 }
