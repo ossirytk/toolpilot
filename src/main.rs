@@ -126,7 +126,11 @@ fn handle_request(state: &mut ServerState, request: RpcRequest) -> Option<RpcRes
                 Ok((name, args)) => execute_tool(state, name, args),
                 Err(error) => error,
             };
-            Some(json!({"structuredContent": payload}))
+            let text = serde_json::to_string(&payload).unwrap_or_default();
+            Some(json!({
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": payload
+            }))
         }
         "ping" => Some(json!({})),
         _ => None,
@@ -188,10 +192,9 @@ async fn read_message(reader: &mut BufReader<tokio::io::Stdin>) -> io::Result<Op
 }
 
 async fn write_message(writer: &mut tokio::io::Stdout, response: &RpcResponse) -> io::Result<()> {
-    let payload = serde_json::to_vec(response)
+    let mut payload = serde_json::to_vec(response)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "serialization failed"))?;
-    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
-    writer.write_all(header.as_bytes()).await?;
+    payload.push(b'\n');
     writer.write_all(&payload).await?;
     writer.flush().await
 }
