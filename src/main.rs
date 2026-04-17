@@ -11,7 +11,9 @@ use toolpilot::{
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
-    id: Value,
+    // Notifications omit `id`; treat those as fire-and-forget (no response sent).
+    #[serde(default)]
+    id: Option<Value>,
     method: String,
     #[serde(default)]
     params: Value,
@@ -108,10 +110,13 @@ fn execute_tool(state: &mut ServerState, name: &str, args: Value) -> Value {
     }
 }
 
-fn handle_request(state: &mut ServerState, request: RpcRequest) -> RpcResponse {
+fn handle_request(state: &mut ServerState, request: RpcRequest) -> Option<RpcResponse> {
+    // Notifications have no `id` — must not send a response.
+    let id = request.id?;
+
     let result = match request.method.as_str() {
         "initialize" => Some(json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": request.params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2024-11-05"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "toolpilot", "version": "0.1.0"}
         })),
@@ -123,36 +128,43 @@ fn handle_request(state: &mut ServerState, request: RpcRequest) -> RpcResponse {
             };
             Some(json!({"structuredContent": payload}))
         }
+        "ping" => Some(json!({})),
         _ => None,
     };
     if let Some(result) = result {
-        RpcResponse {
+        Some(RpcResponse {
             jsonrpc: "2.0",
-            id: request.id,
+            id,
             result: Some(result),
             error: None,
-        }
+        })
     } else {
-        RpcResponse {
+        Some(RpcResponse {
             jsonrpc: "2.0",
-            id: request.id,
+            id,
             result: None,
             error: Some(json!({
                 "code": -32601,
                 "message": "Method not found"
             })),
-        }
+        })
     }
 }
 
 async fn read_message(reader: &mut BufReader<tokio::io::Stdin>) -> io::Result<Option<Vec<u8>>> {
-    let mut content_length = None;
+    let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
         let read = reader.read_line(&mut line).await?;
         if read == 0 {
             return Ok(None);
         }
+        // Newline-delimited JSON: the line IS the message body
+        if line.starts_with('{') {
+            let trimmed = line.trim_end_matches(['\r', '\n']).as_bytes().to_vec();
+            return Ok(Some(trimmed));
+        }
+        // Content-Length framing
         if line == "\r\n" || line == "\n" {
             break;
         }
@@ -172,10 +184,9 @@ async fn read_message(reader: &mut BufReader<tokio::io::Stdin>) -> io::Result<Op
 }
 
 async fn write_message(writer: &mut tokio::io::Stdout, response: &RpcResponse) -> io::Result<()> {
-    let payload = serde_json::to_vec(response)
+    let mut payload = serde_json::to_vec(response)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "serialization failed"))?;
-    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
-    writer.write_all(header.as_bytes()).await?;
+    payload.push(b'\n');
     writer.write_all(&payload).await?;
     writer.flush().await
 }
@@ -190,23 +201,30 @@ async fn main() -> io::Result<()> {
         let request: RpcRequest = match serde_json::from_slice(&payload) {
             Ok(request) => request,
             Err(_) => {
-                let response = RpcResponse {
-                    jsonrpc: "2.0",
-                    id: Value::Null,
-                    result: None,
-                    error: Some(json!({
-                        "code": -32700,
-                        "message": "Parse error"
-                    })),
-                };
-                write_message(&mut writer, &response).await?;
+                // Only send a parse-error response if we can extract an id; notifications
+                // (no id) must never receive a response per JSON-RPC 2.0.
+                if let Ok(probe) = serde_json::from_slice::<Value>(&payload)
+                    && probe.get("id").is_some()
+                {
+                    let response = RpcResponse {
+                        jsonrpc: "2.0",
+                        id: probe["id"].clone(),
+                        result: None,
+                        error: Some(json!({
+                            "code": -32700,
+                            "message": "Parse error"
+                        })),
+                    };
+                    write_message(&mut writer, &response).await?;
+                }
                 continue;
             }
         };
         #[cfg(feature = "verbose-logging")]
         eprintln!("received method={}", request.method);
-        let response = handle_request(&mut state, request);
-        write_message(&mut writer, &response).await?;
+        if let Some(response) = handle_request(&mut state, request) {
+            write_message(&mut writer, &response).await?;
+        }
     }
     Ok(())
 }
