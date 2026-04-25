@@ -22,49 +22,6 @@ All terminal commands should be reproducible from the supported shell/editor com
 
 ---
 
-## 0.1 Available CLI Tools
-
-The following tools are installed locally and available for use in terminal workflows and agent tasks:
-
-| Tool | Purpose |
-|------|---------|
-| `diffutils` | File comparison (`diff`, `cmp`, `diff3`, `sdiff`) |
-| `fd` | Fast, user-friendly alternative to `find` for file search |
-| `fzf` | General-purpose fuzzy finder for interactive filtering |
-| `ripgrep` (`rg`) | Fast regex search across files; prefer over `grep`/`Select-String` |
-| `zip` | Archive creation and extraction |
-| `tokei` | Count lines of code by language |
-| `ast-grep` (`sg`) | Structural code search and rewriting using AST patterns |
-| `jq` | JSON query and transformation CLI |
-| `yq` | YAML/JSON/TOML query and transformation CLI |
-| `hyperfine` | Command-line benchmarking with statistical output |
-| `pre-commit` | Run and manage repository pre-commit hooks |
-| `http` / `https` (HTTPie) | Human-friendly HTTP API client |
-| `just` | Project task runner via `justfile` recipes |
-| `difft` (difftastic) | Syntax-aware structural diffing |
-
-Prefer these tools over PowerShell built-ins where applicable (e.g., use `rg` instead of `Select-String`, use `fd` instead of `Get-ChildItem` for file discovery).
-
-### Preferred command order
-
-- Content search: `rg` first, then `ast-grep` for structural/language-aware matching
-- File discovery: `fd` first, then `rg --files` as a fallback
-- JSON config inspection: `jq`
-- YAML/TOML inspection: `yq`
-- HTTP/API smoke checks: `http` / `https` (HTTPie)
-- Task orchestration: `just` recipes when a `justfile` exists
-- Diff/review: `difft` for syntax-aware diffs, `diff` for plain text diffs
-- Performance comparisons: `hyperfine` for repeatable timing
-
-### Avoid in autonomous runs
-
-- Avoid interactive-only flows (for example `fzf` prompts) unless the user explicitly asks for interactive selection
-- Avoid destructive git/file operations unless the user explicitly approves them
-- Avoid long-running watch commands by default; use one-shot checks first, then switch to watch mode only when requested
-- Avoid invoking `pre-commit run --all-files` on very large repos when a targeted path or hook is enough for the task
-
----
-
 ## 1. Authoritative Tools & Source of Truth
 
 ### Rust
@@ -110,13 +67,11 @@ cargo fmt --check
 
 ### VS Code Settings
 - Use the Rust Analyzer extension for Rust language support
-- Use the Ruff extension for Python real-time linting
 - Terminal integration: Use the integrated PowerShell terminal by default; WSL + `fish` remains a supported alternative
 
 ### LazyVim/Neovim
 - Configure rust-analyzer LSP for Rust
-- Configure LSP to use linting results from Ruff for Python
-- Do not rely on editor auto-formatting; use `cargo fmt` / `uv run ruff format` before committing
+- Do not rely on editor auto-formatting; use `cargo fmt` before committing
 
 ---
 
