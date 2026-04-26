@@ -63,7 +63,7 @@ cargo fmt
 cargo fmt --check
 ```
 
-## 4. Editor Configuration
+## 3. Editor Configuration
 
 ### VS Code Settings
 - Use the Rust Analyzer extension for Rust language support
@@ -75,7 +75,7 @@ cargo fmt --check
 
 ---
 
-## 5. Git Workflow Discipline
+## 4. Git Workflow Discipline
 
 - Run `cargo clippy -- -D warnings` and `cargo fmt --check` before committing Rust changes
 - Verify all checks pass cleanly before opening a PR

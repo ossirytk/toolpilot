@@ -24,8 +24,18 @@ files, and compiled regexes.
 
 A Rust toolchain is required. Install it via [rustup](https://rustup.rs/):
 
+**Linux / macOS:**
+
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+**Windows (PowerShell):**
+
+Download and run `rustup-init.exe` from <https://rustup.rs/>, or install via winget:
+
+```powershell
+winget install Rustlang.Rustup
 ```
 
 ### Option 1 — `cargo install` from GitHub (recommended)
@@ -81,14 +91,29 @@ directory) and set `command` to the binary path:
 }
 ```
 
-If the binary is not on your `PATH`, use the absolute path instead:
+If the binary is not on your `PATH`, use the absolute path to the compiled binary instead:
+
+**Linux / macOS:**
 
 ```json
 {
   "mcpServers": {
     "toolpilot": {
       "type": "stdio",
-      "command": "/absolute/path/to/toolpilot"
+      "command": "/absolute/path/to/toolpilot/target/release/toolpilot"
+    }
+  }
+}
+```
+
+**Windows:**
+
+```json
+{
+  "mcpServers": {
+    "toolpilot": {
+      "type": "stdio",
+      "command": "C:\\path\\to\\toolpilot\\target\\release\\toolpilot.exe"
     }
   }
 }
