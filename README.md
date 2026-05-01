@@ -11,7 +11,6 @@ High‑performance persistent MCP server for GitHub Copilot CLI and VS Code Copi
 | `text_search` | Literal/regex search with line and byte offsets |
 | `json_select` | Explicit field selection and typed filters for JSON files |
 | `yaml_select` | Field extraction from YAML/TOML files using dot-notation paths |
-| `git_log` | Git commit history with optional path filter |
 | `server_stats` | Request and cache counters |
 
 The server runs as a single persistent stdio MCP process, returns structured

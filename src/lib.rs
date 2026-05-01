@@ -20,8 +20,6 @@ pub const MAX_TREE_DEPTH_HARD_CAP: usize = 10;
 pub const MAX_TREE_ENTRIES_DEFAULT: usize = 200;
 pub const MAX_TREE_ENTRIES_HARD_CAP: usize = 2000;
 
-pub const MAX_GIT_COMMITS_DEFAULT: usize = 20;
-pub const MAX_GIT_COMMITS_HARD_CAP: usize = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolError {
@@ -670,170 +668,6 @@ pub fn execute_yaml_select(
     })
 }
 
-// ── git_log ───────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GitLogInput {
-    pub repo_path: String,
-    pub path_filter: Option<String>,
-    pub max_results: Option<usize>,
-    pub include_diff_stat: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CommitEntry {
-    pub sha: String,
-    pub author: String,
-    pub date: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub files_changed: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GitLogOutput {
-    pub commits: Vec<CommitEntry>,
-    pub count: usize,
-    pub truncated: bool,
-}
-
-fn unix_to_iso8601(seconds: i64) -> String {
-    if seconds < 0 {
-        return "1970-01-01T00:00:00Z".to_string();
-    }
-    let s = seconds as u64;
-    let days = s / 86400;
-    let rem = s % 86400;
-    let h = rem / 3600;
-    let m = (rem % 3600) / 60;
-    let sec = rem % 60;
-    // Civil date from days since Unix epoch — Hinnant's algorithm
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{sec:02}Z")
-}
-
-fn commit_touches_path(repo: &git2::Repository, commit: &git2::Commit, path_filter: &str) -> bool {
-    let commit_tree = match commit.tree() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    let mut opts = git2::DiffOptions::new();
-    opts.pathspec(path_filter);
-    let diff =
-        match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), Some(&mut opts)) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-    diff.stats().map(|s| s.files_changed() > 0).unwrap_or(false)
-}
-
-fn commit_files(repo: &git2::Repository, commit: &git2::Commit) -> Vec<String> {
-    let commit_tree = match commit.tree() {
-        Ok(t) => t,
-        Err(_) => return vec![],
-    };
-    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), None) {
-        Ok(d) => d,
-        Err(_) => return vec![],
-    };
-    let mut files = Vec::new();
-    for delta in diff.deltas() {
-        let path = delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-            .map(|p| p.to_string_lossy().to_string());
-        if let Some(p) = path {
-            files.push(p);
-        }
-    }
-    files
-}
-
-pub fn execute_git_log(input: GitLogInput) -> ToolResult<GitLogOutput> {
-    let max_results = input.max_results.unwrap_or(MAX_GIT_COMMITS_DEFAULT);
-    if max_results > MAX_GIT_COMMITS_HARD_CAP {
-        return Err(ToolError {
-            code: "InvalidInput".to_string(),
-            message: format!("max_results cannot exceed {MAX_GIT_COMMITS_HARD_CAP}"),
-        });
-    }
-    let include_diff_stat = input.include_diff_stat.unwrap_or(false);
-
-    let repo = git2::Repository::discover(&input.repo_path).map_err(|e| ToolError {
-        code: "GitError".to_string(),
-        message: format!("Cannot open repository: {}", e.message()),
-    })?;
-
-    let mut revwalk = repo.revwalk().map_err(|e| ToolError {
-        code: "GitError".to_string(),
-        message: format!("Cannot walk repository: {}", e.message()),
-    })?;
-    revwalk.push_head().map_err(|e| ToolError {
-        code: "GitError".to_string(),
-        message: format!("Cannot read HEAD: {}", e.message()),
-    })?;
-
-    let mut commits = Vec::new();
-    let mut truncated = false;
-
-    for oid in revwalk {
-        let oid = oid.map_err(|e| ToolError {
-            code: "GitError".to_string(),
-            message: format!("Walk error: {}", e.message()),
-        })?;
-        let commit = repo.find_commit(oid).map_err(|e| ToolError {
-            code: "GitError".to_string(),
-            message: format!("Cannot read commit: {}", e.message()),
-        })?;
-
-        if input
-            .path_filter
-            .as_deref()
-            .is_some_and(|filter| !commit_touches_path(&repo, &commit, filter))
-        {
-            continue;
-        }
-
-        if commits.len() == max_results {
-            truncated = true;
-            break;
-        }
-
-        let files_changed = if include_diff_stat {
-            Some(commit_files(&repo, &commit))
-        } else {
-            None
-        };
-
-        commits.push(CommitEntry {
-            sha: oid.to_string(),
-            author: commit.author().name().unwrap_or("Unknown").to_string(),
-            date: unix_to_iso8601(commit.time().seconds()),
-            message: commit.message().unwrap_or("").trim().to_string(),
-            files_changed,
-        });
-    }
-
-    let count = commits.len();
-    Ok(GitLogOutput {
-        commits,
-        count,
-        truncated,
-    })
-}
 
 pub fn tool_definitions() -> Value {
     json!({
@@ -928,21 +762,6 @@ pub fn tool_definitions() -> Value {
                     }
                 }
             },
-            {
-                "name": "git_log",
-                "description": "Query git commit history with optional path filter. Returns structured commit data without shell access.",
-                "inputSchema": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["repo_path"],
-                    "properties": {
-                        "repo_path": {"type": "string"},
-                        "path_filter": {"type": "string"},
-                        "max_results": {"type": "integer", "minimum": 1, "maximum": 500},
-                        "include_diff_stat": {"type": "boolean"}
-                    }
-                }
-            }
         ]
     })
 }
@@ -1341,54 +1160,5 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "UnsupportedFormat");
-    }
-
-    #[test]
-    fn git_log_returns_commits_for_temp_repo() {
-        let dir = tempdir().unwrap();
-        let repo = git2::Repository::init(dir.path()).unwrap();
-        fs::write(dir.path().join("README.md"), "hello\n").unwrap();
-        let mut index = repo.index().unwrap();
-        index.add_path(std::path::Path::new("README.md")).unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        let signature = git2::Signature::now("Toolpilot Test", "toolpilot@example.com").unwrap();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "initial commit",
-            &tree,
-            &[],
-        )
-        .unwrap();
-
-        let out = execute_git_log(GitLogInput {
-            repo_path: dir.path().to_string_lossy().to_string(),
-            path_filter: None,
-            max_results: Some(5),
-            include_diff_stat: Some(false),
-        })
-        .unwrap();
-        assert!(!out.commits.is_empty());
-        // SHA should be a valid 40-char hex string
-        assert_eq!(out.commits[0].sha.len(), 40);
-    }
-
-    #[test]
-    fn git_log_rejects_over_hard_cap() {
-        let err = execute_git_log(GitLogInput {
-            repo_path: ".".to_string(),
-            path_filter: None,
-            max_results: Some(MAX_GIT_COMMITS_HARD_CAP + 1),
-            include_diff_stat: None,
-        })
-        .unwrap_err();
-        assert_eq!(err.code, "InvalidInput");
-    }
-
-    #[test]
-    fn unix_to_iso8601_formats_epoch_correctly() {
-        assert_eq!(unix_to_iso8601(0), "1970-01-01T00:00:00Z");
     }
 }
