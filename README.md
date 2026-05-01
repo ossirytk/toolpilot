@@ -76,8 +76,7 @@ After installation, register toolpilot as an MCP server in your editor or CLI.
 
 ### GitHub Copilot CLI
 
-Copy `.mcp.example.json` to `.mcp.json` in your project root (or home
-directory) and set `command` to the binary path:
+Copy `mcp-config.example.json` to `~/.copilot/mcp-config.json` and set `command` to the binary path:
 
 ```json
 {
