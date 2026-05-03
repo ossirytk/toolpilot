@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "toolpilot": {
+      "type": "stdio",
+      "command": "/path/to/toolpilot/target/release/toolpilot",
+      "args": [],
+      "tools": ["*"]
+    }
+  }
+}
