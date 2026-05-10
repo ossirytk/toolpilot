@@ -7,11 +7,14 @@ High‑performance persistent MCP server for GitHub Copilot CLI and VS Code Copi
 | Tool | Description |
 |------|-------------|
 | `fs_glob` | Deterministic glob expansion with capped output |
-| `fs_tree` | Depth-limited directory tree as structured JSON |
-| `text_search` | Literal/regex search with line and byte offsets |
+| `fs_tree` | Depth-limited directory tree (`include_hidden` available for dotfiles/dirs) |
+| `text_search` | Literal/regex search with line and byte offsets, plus optional `glob` / `file_type` filters |
+| `read_file` | UTF-8 file reader with optional `start_line`/`end_line` and `max_bytes` cap |
 | `json_select` | Explicit field selection and typed filters for JSON files |
-| `yaml_select` | Field extraction from YAML/TOML files using dot-notation paths |
-| `server_stats` | Request and cache counters |
+| `yaml_select` | Field extraction from YAML/TOML using dot-notation paths (including array indexes like `jobs.0.steps`) |
+| `file_hash` | File checksums for `sha256` (default), `sha1`, and `md5` |
+| `git_log` | Structured git history with optional diff stat and unified diff output |
+| `server_stats` | Request/cache counters including cache entries and eviction counters |
 
 The server runs as a single persistent stdio MCP process, returns structured
 JSON only, and uses in-process caches for parsed JSON, memory-mapped text

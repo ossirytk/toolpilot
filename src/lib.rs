@@ -1,14 +1,20 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use glob::glob;
+use glob::{Pattern, glob};
+use md5::Md5;
 use memmap2::Mmap;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 
 pub const MAX_PATHS: usize = 128;
 pub const MAX_PATTERN_LENGTH: usize = 512;
@@ -20,6 +26,12 @@ pub const MAX_TREE_DEPTH_HARD_CAP: usize = 10;
 pub const MAX_TREE_ENTRIES_DEFAULT: usize = 200;
 pub const MAX_TREE_ENTRIES_HARD_CAP: usize = 2000;
 
+pub const MAX_READ_BYTES_DEFAULT: usize = 16 * 1024;
+pub const MAX_READ_BYTES_HARD_CAP: usize = 1024 * 1024;
+pub const MAX_DIFF_LINES_DEFAULT: usize = 200;
+pub const MAX_DIFF_LINES_HARD_CAP: usize = 2000;
+pub const MAX_GIT_LOG_RESULTS_DEFAULT: usize = 20;
+pub const MAX_GIT_LOG_RESULTS_HARD_CAP: usize = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolError {
@@ -35,6 +47,39 @@ fn resolve_max_results(max_results: Option<usize>) -> ToolResult<usize> {
         return Err(ToolError {
             code: "InvalidInput".to_string(),
             message: format!("max_results cannot exceed {}", MAX_RESULTS_HARD_CAP),
+        });
+    }
+    Ok(value)
+}
+
+fn resolve_max_read_bytes(max_bytes: Option<usize>) -> ToolResult<usize> {
+    let value = max_bytes.unwrap_or(MAX_READ_BYTES_DEFAULT).max(1);
+    if value > MAX_READ_BYTES_HARD_CAP {
+        return Err(ToolError {
+            code: "InvalidInput".to_string(),
+            message: format!("max_bytes cannot exceed {}", MAX_READ_BYTES_HARD_CAP),
+        });
+    }
+    Ok(value)
+}
+
+fn resolve_max_diff_lines(max_lines: Option<usize>) -> ToolResult<usize> {
+    let value = max_lines.unwrap_or(MAX_DIFF_LINES_DEFAULT).max(1);
+    if value > MAX_DIFF_LINES_HARD_CAP {
+        return Err(ToolError {
+            code: "InvalidInput".to_string(),
+            message: format!("max_diff_lines cannot exceed {}", MAX_DIFF_LINES_HARD_CAP),
+        });
+    }
+    Ok(value)
+}
+
+fn resolve_max_git_log_results(max_results: Option<usize>) -> ToolResult<usize> {
+    let value = max_results.unwrap_or(MAX_GIT_LOG_RESULTS_DEFAULT).max(1);
+    if value > MAX_GIT_LOG_RESULTS_HARD_CAP {
+        return Err(ToolError {
+            code: "InvalidInput".to_string(),
+            message: format!("max_results cannot exceed {}", MAX_GIT_LOG_RESULTS_HARD_CAP),
         });
     }
     Ok(value)
@@ -61,6 +106,10 @@ pub struct ServerState {
     requests_per_tool: BTreeMap<String, u64>,
     cache_hits: u64,
     cache_misses: u64,
+    json_cache_evictions: u64,
+    text_cache_evictions: u64,
+    regex_cache_evictions: u64,
+    yaml_cache_evictions: u64,
     yaml_cache: HashMap<PathBuf, CachedJson>,
 }
 
@@ -74,11 +123,27 @@ impl ServerState {
     }
 
     pub fn metrics_json(&self) -> Value {
+        let cache_entries = json!({
+            "json": self.json_cache.len(),
+            "text": self.text_cache.len(),
+            "regex": self.regex_cache.len(),
+            "yaml": self.yaml_cache.len(),
+            "total": self.json_cache.len() + self.text_cache.len() + self.regex_cache.len() + self.yaml_cache.len()
+        });
+        let cache_evictions = json!({
+            "json": self.json_cache_evictions,
+            "text": self.text_cache_evictions,
+            "regex": self.regex_cache_evictions,
+            "yaml": self.yaml_cache_evictions,
+            "total": self.json_cache_evictions + self.text_cache_evictions + self.regex_cache_evictions + self.yaml_cache_evictions
+        });
         json!({
             "requests_per_tool": self.requests_per_tool,
             "cache": {
                 "hits": self.cache_hits,
-                "misses": self.cache_misses
+                "misses": self.cache_misses,
+                "entries": cache_entries,
+                "evictions": cache_evictions
             }
         })
     }
@@ -284,6 +349,8 @@ pub struct TextSearchInput {
     pub paths: Vec<String>,
     pub query: String,
     pub mode: SearchMode,
+    pub glob: Option<String>,
+    pub file_type: Option<String>,
     pub case_sensitive: Option<bool>,
     pub max_results: Option<usize>,
 }
@@ -323,6 +390,32 @@ pub fn execute_text_search(
 
     let case_sensitive = input.case_sensitive.unwrap_or(true);
     let max_results = resolve_max_results(input.max_results)?;
+    let glob_pattern = match input.glob {
+        Some(pattern) => {
+            if pattern.len() > MAX_PATTERN_LENGTH {
+                return Err(ToolError {
+                    code: "InvalidPattern".to_string(),
+                    message: "glob length is invalid".to_string(),
+                });
+            }
+            Some(Pattern::new(&pattern).map_err(|_| ToolError {
+                code: "InvalidPattern".to_string(),
+                message: "glob failed to compile".to_string(),
+            })?)
+        }
+        None => None,
+    };
+    let file_type = input
+        .file_type
+        .map(|ft| ft.trim_start_matches('.').to_string());
+    if let Some(ft) = &file_type
+        && (ft.is_empty() || ft.len() > MAX_PATTERN_LENGTH)
+    {
+        return Err(ToolError {
+            code: "InvalidPattern".to_string(),
+            message: "file_type length is invalid".to_string(),
+        });
+    }
     let compiled_pattern = match input.mode {
         SearchMode::Literal => regex::escape(&input.query),
         SearchMode::Regex => input.query,
@@ -336,6 +429,21 @@ pub fn execute_text_search(
     let mut matches = Vec::new();
     let mut truncated = false;
     'paths: for path in paths {
+        let path_obj = Path::new(&path);
+        if let Some(pattern) = &glob_pattern
+            && !pattern.matches_path(path_obj)
+        {
+            continue;
+        }
+        if let Some(ft) = &file_type {
+            let ext_matches = path_obj
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext == ft);
+            if !ext_matches {
+                continue;
+            }
+        }
         let mmap = state.load_text(Path::new(&path))?;
         let content = std::str::from_utf8(&mmap).map_err(|_| ToolError {
             code: "UnsupportedEncoding".to_string(),
@@ -367,6 +475,107 @@ pub fn execute_text_search(
         matches,
         count,
         truncated,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadFileInput {
+    pub path: String,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReadFileOutput {
+    pub content: String,
+    pub total_lines: usize,
+    pub returned_lines: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub bytes: usize,
+    pub truncated: bool,
+}
+
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
+    if s.len() <= max_bytes {
+        return (s, false);
+    }
+    let mut idx = max_bytes;
+    while !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    (&s[..idx], true)
+}
+
+pub fn execute_read_file(
+    state: &mut ServerState,
+    input: ReadFileInput,
+) -> ToolResult<ReadFileOutput> {
+    let max_bytes = resolve_max_read_bytes(input.max_bytes)?;
+    let start_line = input.start_line.unwrap_or(1).max(1);
+    let end_line = input.end_line.unwrap_or(usize::MAX);
+    if end_line < start_line {
+        return Err(ToolError {
+            code: "InvalidInput".to_string(),
+            message: "end_line must be greater than or equal to start_line".to_string(),
+        });
+    }
+
+    let mmap = state.load_text(Path::new(&input.path))?;
+    let content = std::str::from_utf8(&mmap).map_err(|_| ToolError {
+        code: "UnsupportedEncoding".to_string(),
+        message: format!("File is not valid UTF-8: {}", input.path),
+    })?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    if total_lines == 0 {
+        return Ok(ReadFileOutput {
+            content: String::new(),
+            total_lines: 0,
+            returned_lines: 0,
+            start_line,
+            end_line: start_line.saturating_sub(1),
+            bytes: 0,
+            truncated: false,
+        });
+    }
+
+    let start_idx = start_line.saturating_sub(1).min(total_lines);
+    let end_idx_exclusive = end_line.min(total_lines);
+    if start_idx >= end_idx_exclusive {
+        return Ok(ReadFileOutput {
+            content: String::new(),
+            total_lines,
+            returned_lines: 0,
+            start_line,
+            end_line: end_idx_exclusive,
+            bytes: 0,
+            truncated: false,
+        });
+    }
+
+    let joined = lines[start_idx..end_idx_exclusive].join("\n");
+    let (trimmed, hit_byte_cap) = truncate_to_char_boundary(&joined, max_bytes);
+    let returned_lines = if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.lines().count()
+    };
+    let range_truncated = end_idx_exclusive < total_lines;
+    Ok(ReadFileOutput {
+        content: trimmed.to_string(),
+        total_lines,
+        returned_lines,
+        start_line,
+        end_line: if returned_lines == 0 {
+            start_line.saturating_sub(1)
+        } else {
+            start_line + returned_lines - 1
+        },
+        bytes: trimmed.len(),
+        truncated: hit_byte_cap || range_truncated,
     })
 }
 
@@ -640,9 +849,16 @@ pub struct YamlSelectOutput {
 fn get_nested<'a>(value: &'a Value, path: &str) -> &'a Value {
     let mut current = value;
     for key in path.split('.') {
-        match current.get(key) {
-            Some(v) => current = v,
-            None => return &Value::Null,
+        if let Ok(index) = key.parse::<usize>() {
+            match current.as_array().and_then(|arr| arr.get(index)) {
+                Some(v) => current = v,
+                None => return &Value::Null,
+            }
+        } else {
+            match current.get(key) {
+                Some(v) => current = v,
+                None => return &Value::Null,
+            }
         }
     }
     current
@@ -668,6 +884,292 @@ pub fn execute_yaml_select(
     })
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HashAlgorithm {
+    Sha256,
+    Sha1,
+    Md5,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHashInput {
+    pub paths: Vec<String>,
+    pub algorithm: Option<HashAlgorithm>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileHashEntry {
+    pub path: String,
+    pub algorithm: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileHashOutput {
+    pub hashes: Vec<FileHashEntry>,
+    pub count: usize,
+}
+
+fn digest_file_with_hasher<D: Digest + Default>(path: &Path) -> ToolResult<String> {
+    let mut file = File::open(path).map_err(|_| ToolError {
+        code: "ReadFailed".to_string(),
+        message: format!("Failed to read file: {}", path.display()),
+    })?;
+    let mut hasher = D::default();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let bytes_read = file.read(&mut buffer).map_err(|_| ToolError {
+            code: "ReadFailed".to_string(),
+            message: format!("Failed to read file: {}", path.display()),
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+pub fn execute_file_hash(input: FileHashInput) -> ToolResult<FileHashOutput> {
+    if input.paths.is_empty() || input.paths.len() > MAX_PATHS {
+        return Err(ToolError {
+            code: "InvalidInput".to_string(),
+            message: "paths must contain between 1 and 128 items".to_string(),
+        });
+    }
+    let algorithm = input.algorithm.unwrap_or(HashAlgorithm::Sha256);
+    let algorithm_name = match algorithm {
+        HashAlgorithm::Sha256 => "sha256",
+        HashAlgorithm::Sha1 => "sha1",
+        HashAlgorithm::Md5 => "md5",
+    };
+
+    let mut paths = input.paths;
+    paths.sort();
+    paths.dedup();
+
+    let mut hashes = Vec::with_capacity(paths.len());
+    for path in paths {
+        let path_ref = Path::new(&path);
+        let digest = match algorithm {
+            HashAlgorithm::Sha256 => digest_file_with_hasher::<Sha256>(path_ref)?,
+            HashAlgorithm::Sha1 => digest_file_with_hasher::<Sha1>(path_ref)?,
+            HashAlgorithm::Md5 => digest_file_with_hasher::<Md5>(path_ref)?,
+        };
+        hashes.push(FileHashEntry {
+            path,
+            algorithm: algorithm_name.to_string(),
+            hash: digest,
+        });
+    }
+
+    Ok(FileHashOutput {
+        count: hashes.len(),
+        hashes,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitLogInput {
+    pub repo_path: String,
+    pub max_results: Option<usize>,
+    pub path_filter: Option<String>,
+    pub include_diff_stat: Option<bool>,
+    pub include_diff: Option<bool>,
+    pub max_diff_lines: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GitDiffStatEntry {
+    pub path: String,
+    pub insertions: Option<usize>,
+    pub deletions: Option<usize>,
+    pub binary: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GitCommit {
+    pub sha: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub date: String,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_stat: Option<Vec<GitDiffStatEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_truncated: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GitLogOutput {
+    pub commits: Vec<GitCommit>,
+    pub count: usize,
+}
+
+fn execute_git(repo_path: &Path, args: &[String]) -> ToolResult<String> {
+    let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(args)
+        .output()
+        .map_err(|e| ToolError {
+            code: "ExecutionFailed".to_string(),
+            message: format!("Failed to execute git: {e}"),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ToolError {
+            code: "GitCommandFailed".to_string(),
+            message: if stderr.is_empty() {
+                format!("Git command failed: git {}", args.join(" "))
+            } else {
+                stderr
+            },
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|_| ToolError {
+        code: "UnsupportedEncoding".to_string(),
+        message: "Git output is not valid UTF-8".to_string(),
+    })
+}
+
+fn parse_numstat(output: &str) -> Vec<GitDiffStatEntry> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let insertions = parts.next()?;
+            let deletions = parts.next()?;
+            let path = parts.next()?.to_string();
+            let binary = insertions == "-" || deletions == "-";
+            Some(GitDiffStatEntry {
+                path,
+                insertions: insertions.parse::<usize>().ok(),
+                deletions: deletions.parse::<usize>().ok(),
+                binary,
+            })
+        })
+        .collect()
+}
+
+fn truncate_diff_lines(diff: &str, max_lines: usize) -> (String, bool) {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (count, line) in diff.lines().enumerate() {
+        if count == max_lines {
+            truncated = true;
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    (out, truncated)
+}
+
+pub fn execute_git_log(input: GitLogInput) -> ToolResult<GitLogOutput> {
+    let repo_path = PathBuf::from(&input.repo_path);
+    let max_results = resolve_max_git_log_results(input.max_results)?;
+    let max_diff_lines = resolve_max_diff_lines(input.max_diff_lines)?;
+    let include_diff_stat = input.include_diff_stat.unwrap_or(false);
+    let include_diff = input.include_diff.unwrap_or(false);
+
+    let mut log_args = vec![
+        "--no-pager".to_string(),
+        "log".to_string(),
+        format!("-n{max_results}"),
+        "--date=iso-strict".to_string(),
+        "--pretty=format:%H%x1f%an%x1f%ae%x1f%ad%x1f%s%x1e".to_string(),
+    ];
+    if let Some(path_filter) = &input.path_filter {
+        log_args.push("--".to_string());
+        log_args.push(path_filter.clone());
+    }
+    let log_output = execute_git(&repo_path, &log_args)?;
+
+    let mut commits = Vec::new();
+    for entry in log_output.split('\x1e') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut fields = trimmed.split('\x1f');
+        let Some(sha) = fields.next() else { continue };
+        let Some(author_name) = fields.next() else {
+            continue;
+        };
+        let Some(author_email) = fields.next() else {
+            continue;
+        };
+        let Some(date) = fields.next() else { continue };
+        let Some(subject) = fields.next() else {
+            continue;
+        };
+
+        let mut commit = GitCommit {
+            sha: sha.to_string(),
+            author_name: author_name.to_string(),
+            author_email: author_email.to_string(),
+            date: date.to_string(),
+            subject: subject.to_string(),
+            diff_stat: None,
+            diff: None,
+            diff_truncated: None,
+        };
+
+        if include_diff_stat {
+            let mut stat_args = vec![
+                "--no-pager".to_string(),
+                "show".to_string(),
+                "--format=".to_string(),
+                "--numstat".to_string(),
+                "--no-renames".to_string(),
+                commit.sha.clone(),
+            ];
+            if let Some(path_filter) = &input.path_filter {
+                stat_args.push("--".to_string());
+                stat_args.push(path_filter.clone());
+            }
+            let stat_output = execute_git(&repo_path, &stat_args)?;
+            commit.diff_stat = Some(parse_numstat(&stat_output));
+        }
+
+        if include_diff {
+            let mut diff_args = vec![
+                "--no-pager".to_string(),
+                "show".to_string(),
+                "--format=".to_string(),
+                "--unified=3".to_string(),
+                commit.sha.clone(),
+            ];
+            if let Some(path_filter) = &input.path_filter {
+                diff_args.push("--".to_string());
+                diff_args.push(path_filter.clone());
+            }
+            let diff_output = execute_git(&repo_path, &diff_args)?;
+            let (diff, diff_truncated) = truncate_diff_lines(&diff_output, max_diff_lines);
+            commit.diff = Some(diff);
+            commit.diff_truncated = Some(diff_truncated);
+        }
+
+        commits.push(commit);
+    }
+
+    Ok(GitLogOutput {
+        count: commits.len(),
+        commits,
+    })
+}
 
 pub fn tool_definitions() -> Value {
     json!({
@@ -688,7 +1190,7 @@ pub fn tool_definitions() -> Value {
             },
             {
                 "name": "text_search",
-                "description": "Regex/literal text search with line + byte offsets",
+                "description": "Regex/literal text search with line + byte offsets and optional path filtering",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -697,8 +1199,25 @@ pub fn tool_definitions() -> Value {
                         "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_PATHS},
                         "query": {"type": "string", "minLength": 1, "maxLength": MAX_PATTERN_LENGTH},
                         "mode": {"type": "string", "enum": ["literal", "regex"]},
+                        "glob": {"type": "string", "maxLength": MAX_PATTERN_LENGTH},
+                        "file_type": {"type": "string", "maxLength": MAX_PATTERN_LENGTH},
                         "case_sensitive": {"type": "boolean"},
                         "max_results": {"type": "integer", "minimum": 1, "maximum": 5000}
+                    }
+                }
+            },
+            {
+                "name": "read_file",
+                "description": "Read a UTF-8 text file with optional line range and byte cap",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer", "minimum": 1},
+                        "end_line": {"type": "integer", "minimum": 1},
+                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES_HARD_CAP}
                     }
                 }
             },
@@ -731,12 +1250,12 @@ pub fn tool_definitions() -> Value {
             },
             {
                 "name": "server_stats",
-                "description": "Lightweight counters for requests and cache behavior",
+                "description": "Lightweight counters for requests and cache behavior, including cache entries and evictions",
                 "inputSchema": {"type": "object", "additionalProperties": false}
             },
             {
                 "name": "fs_tree",
-                "description": "Depth-limited directory tree as structured JSON. Use for project orientation before diving into specifics.",
+                "description": "Depth-limited directory tree as structured JSON. Set include_hidden=true to include hidden files and directories.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -751,7 +1270,7 @@ pub fn tool_definitions() -> Value {
             },
             {
                 "name": "yaml_select",
-                "description": "Extract specific fields from YAML (.yml/.yaml) or TOML (.toml) files using dot-notation paths. Returns only the requested fields, saving context.",
+                "description": "Extract specific fields from YAML (.yml/.yaml) or TOML (.toml) files using dot-notation paths (including array indexes like jobs.0.steps).",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -759,6 +1278,36 @@ pub fn tool_definitions() -> Value {
                     "properties": {
                         "path": {"type": "string"},
                         "fields": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_FIELDS}
+                    }
+                }
+            },
+            {
+                "name": "file_hash",
+                "description": "Compute file checksums (sha256 by default, plus sha1 and md5)",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["paths"],
+                    "properties": {
+                        "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_PATHS},
+                        "algorithm": {"type": "string", "enum": ["sha256", "sha1", "md5"]}
+                    }
+                }
+            },
+            {
+                "name": "git_log",
+                "description": "Query git commit history with optional file stats and unified diff output",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["repo_path"],
+                    "properties": {
+                        "repo_path": {"type": "string"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GIT_LOG_RESULTS_HARD_CAP},
+                        "path_filter": {"type": "string"},
+                        "include_diff_stat": {"type": "boolean"},
+                        "include_diff": {"type": "boolean"},
+                        "max_diff_lines": {"type": "integer", "minimum": 1, "maximum": MAX_DIFF_LINES_HARD_CAP}
                     }
                 }
             },
@@ -770,6 +1319,7 @@ pub fn tool_definitions() -> Value {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -806,6 +1356,8 @@ mod tests {
                 ],
                 query: "needle".to_string(),
                 mode: SearchMode::Literal,
+                glob: None,
+                file_type: None,
                 case_sensitive: Some(true),
                 max_results: Some(5),
             },
@@ -829,6 +1381,8 @@ mod tests {
                 paths: vec![path.to_string_lossy().to_string()],
                 query: "needle".to_string(),
                 mode: SearchMode::Literal,
+                glob: None,
+                file_type: None,
                 case_sensitive: Some(true),
                 max_results: Some(10),
             },
@@ -837,6 +1391,35 @@ mod tests {
         assert_eq!(out.count, 1);
         assert_eq!(out.matches[0].line, 1);
         assert_eq!(out.matches[0].byte_end, 6);
+    }
+
+    #[test]
+    fn text_search_supports_glob_and_file_type_filters() {
+        let dir = tempdir().unwrap();
+        let py = dir.path().join("a.py");
+        let txt = dir.path().join("b.txt");
+        fs::write(&py, "needle\n").unwrap();
+        fs::write(&txt, "needle\n").unwrap();
+
+        let mut state = ServerState::new();
+        let out = execute_text_search(
+            &mut state,
+            TextSearchInput {
+                paths: vec![
+                    py.to_string_lossy().to_string(),
+                    txt.to_string_lossy().to_string(),
+                ],
+                query: "needle".to_string(),
+                mode: SearchMode::Literal,
+                glob: Some("*.py".to_string()),
+                file_type: Some("py".to_string()),
+                case_sensitive: Some(true),
+                max_results: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(out.count, 1);
+        assert!(out.matches[0].file.ends_with("a.py"));
     }
 
     #[test]
@@ -894,6 +1477,8 @@ mod tests {
                 paths: vec![txt_path.to_string_lossy().to_string()],
                 query: "x".to_string(),
                 mode: SearchMode::Literal,
+                glob: None,
+                file_type: None,
                 case_sensitive: Some(true),
                 max_results: Some(MAX_RESULTS_HARD_CAP + 1),
             },
@@ -928,6 +1513,8 @@ mod tests {
                 paths: vec![file_path.to_string_lossy().to_string()],
                 query: "needle".to_string(),
                 mode: SearchMode::Literal,
+                glob: None,
+                file_type: None,
                 case_sensitive: Some(true),
                 max_results: Some(1),
             },
@@ -950,6 +1537,30 @@ mod tests {
         .unwrap();
         assert_eq!(json.count, 1);
         assert!(!json.truncated);
+    }
+
+    #[test]
+    fn read_file_supports_line_ranges_and_byte_cap() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("sample.txt");
+        fs::write(&file, "one\ntwo\nthree\nfour\n").unwrap();
+
+        let mut state = ServerState::new();
+        let out = execute_read_file(
+            &mut state,
+            ReadFileInput {
+                path: file.to_string_lossy().to_string(),
+                start_line: Some(2),
+                end_line: Some(4),
+                max_bytes: Some(7),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out.content, "two\nthr");
+        assert_eq!(out.start_line, 2);
+        assert_eq!(out.end_line, 3);
+        assert!(out.truncated);
     }
 
     #[test]
@@ -1110,6 +1721,30 @@ mod tests {
     }
 
     #[test]
+    fn yaml_select_supports_array_index_paths() {
+        let dir = tempdir().unwrap();
+        let yaml_path = dir.path().join("pipeline.yml");
+        fs::write(
+            &yaml_path,
+            "jobs:\n  - steps:\n      - run: test\n      - run: lint\n",
+        )
+        .unwrap();
+        let mut state = ServerState::new();
+        let out = execute_yaml_select(
+            &mut state,
+            YamlSelectInput {
+                path: yaml_path.to_string_lossy().to_string(),
+                fields: vec!["jobs.0.steps.1.run".to_string()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.data["jobs.0.steps.1.run"],
+            Value::String("lint".to_string())
+        );
+    }
+
+    #[test]
     fn yaml_select_returns_null_for_missing_field() {
         let dir = tempdir().unwrap();
         let yaml_path = dir.path().join("data.yaml");
@@ -1160,5 +1795,112 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, "UnsupportedFormat");
+    }
+
+    #[test]
+    fn file_hash_computes_sha256() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        fs::write(&path, "abc").unwrap();
+        let out = execute_file_hash(FileHashInput {
+            paths: vec![path.to_string_lossy().to_string()],
+            algorithm: None,
+        })
+        .unwrap();
+        assert_eq!(
+            out.hashes[0].hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn git_log_can_include_diff_content() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(["init"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let file = repo.join("a.txt");
+        fs::write(&file, "one\n").unwrap();
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(["add", "a.txt"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(["commit", "-m", "first"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        fs::write(&file, "one\ntwo\n").unwrap();
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(["add", "a.txt"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(["commit", "-m", "second"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let out = execute_git_log(GitLogInput {
+            repo_path: repo.to_string_lossy().to_string(),
+            max_results: Some(1),
+            path_filter: None,
+            include_diff_stat: Some(true),
+            include_diff: Some(true),
+            max_diff_lines: Some(50),
+        })
+        .unwrap();
+        assert_eq!(out.count, 1);
+        assert!(out.commits[0].diff.is_some());
+        assert!(
+            out.commits[0]
+                .diff_stat
+                .as_ref()
+                .is_some_and(|d| !d.is_empty())
+        );
+    }
+
+    #[test]
+    fn server_stats_reports_entries_and_evictions() {
+        let mut state = ServerState::new();
+        state.record_request("text_search");
+        let metrics = state.metrics_json();
+        assert_eq!(
+            metrics["cache"]["evictions"]["total"],
+            Value::Number(0.into())
+        );
+        assert_eq!(
+            metrics["cache"]["entries"]["total"],
+            Value::Number(0.into())
+        );
+        assert_eq!(
+            metrics["requests_per_tool"]["text_search"],
+            Value::Number(1.into())
+        );
     }
 }

@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin, stdout};
 use toolpilot::{
-    FsGlobInput, FsTreeInput, JsonSelectInput, ServerState, TextSearchInput,
-    YamlSelectInput, execute_fs_glob, execute_fs_tree, execute_json_select,
-    execute_text_search, execute_yaml_select, tool_definitions,
+    FileHashInput, FsGlobInput, FsTreeInput, GitLogInput, JsonSelectInput, ReadFileInput,
+    ServerState, TextSearchInput, YamlSelectInput, execute_file_hash, execute_fs_glob,
+    execute_fs_tree, execute_git_log, execute_json_select, execute_read_file, execute_text_search,
+    execute_yaml_select, tool_definitions,
 };
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +68,14 @@ fn execute_tool(state: &mut ServerState, name: &str, args: Value) -> Value {
                 )
                 .map_err(|_| invalid_params("Serialization failed"))
             }),
+        "read_file" => serde_json::from_value::<ReadFileInput>(args)
+            .map_err(|_| invalid_params("Invalid read_file arguments"))
+            .and_then(|input| {
+                serde_json::to_value(
+                    execute_read_file(state, input).map_err(|e| json!({ "error": e }))?,
+                )
+                .map_err(|_| invalid_params("Serialization failed"))
+            }),
         "json_select" => serde_json::from_value::<JsonSelectInput>(args)
             .map_err(|_| invalid_params("Invalid json_select arguments"))
             .and_then(|input| {
@@ -88,6 +97,18 @@ fn execute_tool(state: &mut ServerState, name: &str, args: Value) -> Value {
                     execute_yaml_select(state, input).map_err(|e| json!({ "error": e }))?,
                 )
                 .map_err(|_| invalid_params("Serialization failed"))
+            }),
+        "file_hash" => serde_json::from_value::<FileHashInput>(args)
+            .map_err(|_| invalid_params("Invalid file_hash arguments"))
+            .and_then(|input| {
+                serde_json::to_value(execute_file_hash(input).map_err(|e| json!({ "error": e }))?)
+                    .map_err(|_| invalid_params("Serialization failed"))
+            }),
+        "git_log" => serde_json::from_value::<GitLogInput>(args)
+            .map_err(|_| invalid_params("Invalid git_log arguments"))
+            .and_then(|input| {
+                serde_json::to_value(execute_git_log(input).map_err(|e| json!({ "error": e }))?)
+                    .map_err(|_| invalid_params("Serialization failed"))
             }),
         "server_stats" => Ok(state.metrics_json()),
         _ => Err(json!({
