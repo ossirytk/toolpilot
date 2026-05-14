@@ -449,9 +449,8 @@ pub fn execute_text_search(
             code: "UnsupportedEncoding".to_string(),
             message: format!("File is not valid UTF-8: {path}"),
         })?;
-        let mut line_no = 1usize;
         let mut line_start = 0usize;
-        for line in content.split_inclusive('\n') {
+        for (line_no, line) in (1usize..).zip(content.split_inclusive('\n')) {
             for capture in regex.find_iter(line) {
                 if matches.len() == max_results {
                     truncated = true;
@@ -466,7 +465,6 @@ pub fn execute_text_search(
                 });
             }
             line_start += line.len();
-            line_no += 1;
         }
     }
 
